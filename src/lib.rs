@@ -8,12 +8,13 @@
 //!
 //! ## Features
 //!
-//! - **Zero-cost abstraction**: Trait-based design with no runtime overhead
+//! - **Zero-cost routing**: Trait-based design; a pool handle is one `Arc` clone
 //! - **Type-safe routing**: Compile-time guarantees for read/write pool separation
+//! - **Runtime pool replacement**: [`DbPools::replace`] atomically swaps the active pools
+//!   and every existing clone of the `DbPools` observes the swap on its next call
 //! - **Backward compatible**: `PgPool` implements `PoolProvider` for seamless integration
 //! - **Flexible**: Use single pool or separate primary/replica pools
 //! - **Test helpers**: [`TestDbPools`] for testing with `#[sqlx::test]`
-//! - **Well-tested**: Comprehensive test suite with replica routing verification
 //!
 //! ## Quick Start
 //!
@@ -67,111 +68,272 @@
 //! # }
 //! ```
 //!
-//! ## Architecture
+//! ### Replacing pools at runtime
 //!
-//! ```text
-//! ┌─────────────┐
-//! │   DbPools   │
-//! └──────┬──────┘
-//!        │
-//!   ┌────┴────┐
-//!   ↓         ↓
-//! ┌─────┐  ┌─────────┐
-//! │Primary│  │ Replica │ (optional)
-//! └─────┘  └─────────┘
+//! sqlx pools are fixed-size once built. When the right size changes at runtime
+//! (for example when a per-role connection budget is re-divided across a changing
+//! number of replicas) build a new pool and swap it in. Every component holding a
+//! clone of the `DbPools` — request handlers, background daemons — picks up the
+//! new pool on its next `.read()` / `.write()` call without being restarted.
+//!
+//! ```rust,no_run
+//! use sqlx::postgres::PgPoolOptions;
+//! use sqlx_pool_router::{DbPools, PoolProvider};
+//!
+//! # async fn example(pools: DbPools) -> Result<(), Box<dyn std::error::Error>> {
+//! let smaller = PgPoolOptions::new()
+//!     .max_connections(5)
+//!     .connect_lazy("postgresql://primary-host/mydb")?;
+//!
+//! let (old_primary, old_replica) = pools.replace(smaller, None);
+//!
+//! // Drain the previous pools in the background: `close()` closes idle
+//! // connections now and the checked-out ones as they are returned, so
+//! // in-flight work on the old pool completes untouched.
+//! tokio::spawn(async move {
+//!     old_primary.close().await;
+//!     if let Some(replica) = old_replica {
+//!         replica.close().await;
+//!     }
+//! });
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! ## Generic Programming
+//! ### Generic Code
 //!
-//! Make your types generic over `PoolProvider` to support both single and multi-pool configurations:
-//!
-//! ```rust
+//! ```rust,no_run
 //! use sqlx_pool_router::PoolProvider;
 //!
-//! struct Repository<P: PoolProvider> {
-//!     pools: P,
-//! }
-//!
-//! impl<P: PoolProvider> Repository<P> {
-//!     async fn get_user(&self, id: i64) -> Result<String, sqlx::Error> {
-//!         // Read from replica
-//!         sqlx::query_scalar("SELECT name FROM users WHERE id = $1")
-//!             .bind(id)
-//!             .fetch_one(self.pools.read())
-//!             .await
-//!     }
-//!
-//!     async fn create_user(&self, name: &str) -> Result<i64, sqlx::Error> {
-//!         // Write to primary
-//!         sqlx::query_scalar("INSERT INTO users (name) VALUES ($1) RETURNING id")
-//!             .bind(name)
-//!             .fetch_one(self.pools.write())
-//!             .await
-//!     }
+//! async fn get_user_count<P: PoolProvider>(pools: &P) -> Result<i64, sqlx::Error> {
+//!     sqlx::query_scalar("SELECT COUNT(*) FROM users")
+//!         .fetch_one(pools.read())
+//!         .await
 //! }
 //! ```
 //!
-//! ## Testing
-//!
-//! Use [`TestDbPools`] with `#[sqlx::test]` to enforce read/write separation in tests:
+//! ### Testing with Read-Only Enforcement
 //!
 //! ```rust,no_run
 //! use sqlx::PgPool;
 //! use sqlx_pool_router::{TestDbPools, PoolProvider};
 //!
 //! #[sqlx::test]
-//! async fn test_repository(pool: PgPool) {
+//! async fn test_read_write_routing(pool: PgPool) {
 //!     let pools = TestDbPools::new(pool).await.unwrap();
 //!
-//!     // Write operations through .read() will FAIL
-//!     let result = sqlx::query("INSERT INTO users VALUES (1)")
+//!     // This works - writes go to write pool
+//!     sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
+//!         .execute(pools.write())
+//!         .await
+//!         .unwrap();
+//!
+//!     // This FAILS - read pool rejects writes
+//!     let result = sqlx::query("INSERT INTO users (name) VALUES ('Bob')")
 //!         .execute(pools.read())
 //!         .await;
 //!     assert!(result.is_err());
 //! }
 //! ```
-//!
-//! This catches routing bugs immediately without needing a real replica database.
 
-use sqlx::PgPool;
+use std::fmt;
 use std::ops::Deref;
+use std::sync::Arc;
 
-/// Trait for providing database pools with read/write routing.
+use arc_swap::ArcSwap;
+use either::Either;
+use futures_util::TryStreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+use sqlx::postgres::PgPool;
+use sqlx::{Database, Describe, Error as SqlxError, Execute, Executor, Postgres};
+
+/// A cheap, owned handle to a `PgPool`.
 ///
-/// Implementations can provide separate read and write pools for load distribution,
-/// or use a single pool for both operations.
+/// Returned by [`PoolProvider::read`] and [`PoolProvider::write`]. It is one
+/// `Arc` clone of the pool that was active at the moment of the call, so it
+/// stays valid even if the provider swaps its pools afterwards ([`DbPools::replace`]).
 ///
-/// # Thread Safety
+/// It dereferences to [`PgPool`] (so `.acquire()`, `.begin()`,
+/// `.connect_options()` etc. work directly) and implements
+/// [`sqlx::Executor`] by value, so it can be passed straight to
+/// `fetch_one` / `execute` / `fetch_all` exactly like `&PgPool`.
 ///
-/// Implementations must be `Clone`, `Send`, and `Sync` to work with async Rust
-/// and be shared across tasks.
+/// Do **not** store a `PoolHandle` long-term: it pins the pool it was taken
+/// from. Store the provider and call `.read()` / `.write()` per operation.
+#[derive(Clone)]
+pub struct PoolHandle(PgPool);
+
+impl PoolHandle {
+    /// Unwrap into the underlying `PgPool`.
+    pub fn into_inner(self) -> PgPool {
+        self.0
+    }
+}
+
+impl From<PgPool> for PoolHandle {
+    fn from(pool: PgPool) -> Self {
+        Self(pool)
+    }
+}
+
+impl From<PoolHandle> for PgPool {
+    fn from(handle: PoolHandle) -> Self {
+        handle.0
+    }
+}
+
+impl Deref for PoolHandle {
+    type Target = PgPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<PgPool> for PoolHandle {
+    fn as_ref(&self) -> &PgPool {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PoolHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("PoolHandle").field(&self.0).finish()
+    }
+}
+
+/// `PoolHandle` executes exactly like `&PgPool`: acquire a connection, run the
+/// query, return the connection. Because `PgPool::acquire` produces a `'static`
+/// future, the handle can be moved into the returned future.
+impl<'p> Executor<'p> for PoolHandle {
+    type Database = Postgres;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<Self::Database as Database>::QueryResult, <Self::Database as Database>::Row>,
+            SqlxError,
+        >,
+    >
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let pool = self.0;
+        Box::pin(async_stream::try_stream! {
+            let mut connection = pool.acquire().await?;
+            let mut stream = connection.fetch_many(query);
+            while let Some(item) = stream.try_next().await? {
+                yield item;
+            }
+        })
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, SqlxError>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let pool = self.0;
+        Box::pin(async move {
+            let mut connection = pool.acquire().await?;
+            connection.fetch_optional(query).await
+        })
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<Self::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+        let pool = self.0;
+        Box::pin(async move {
+            let mut connection = pool.acquire().await?;
+            connection.prepare_with(sql, parameters).await
+        })
+    }
+
+    #[doc(hidden)]
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
+        let pool = self.0;
+        Box::pin(async move {
+            let mut connection = pool.acquire().await?;
+            connection.describe(sql).await
+        })
+    }
+}
+
+/// `&PoolHandle` executes too, so `.execute(&handle)` works wherever code
+/// previously wrote `.execute(&pool)` with a `PgPool` binding.
+impl<'p> Executor<'p> for &'_ PoolHandle {
+    type Database = Postgres;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<Self::Database as Database>::QueryResult, <Self::Database as Database>::Row>,
+            SqlxError,
+        >,
+    >
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.clone().fetch_many(query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, SqlxError>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.clone().fetch_optional(query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<Self::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+        self.clone().prepare_with(sql, parameters)
+    }
+
+    #[doc(hidden)]
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
+        self.clone().describe(sql)
+    }
+}
+
+/// Trait for providing database connection pools with read/write routing.
 ///
-/// # When to Use Each Method
+/// Implement this trait to customize pool selection logic. The default
+/// implementation [`DbPools`] routes reads to a replica (if configured)
+/// and writes to the primary.
 ///
-/// ## `.read()` - For Read Operations
+/// Both methods return an owned [`PoolHandle`] — a cheap `Arc` clone of the
+/// pool that is active *right now*. Providers may replace their pools at
+/// runtime, so fetch a handle per operation rather than caching one.
 ///
-/// Use for queries that:
-/// - Don't modify data (SELECT without FOR UPDATE)
-/// - Can tolerate slight staleness (eventual consistency)
-/// - Benefit from load distribution
+/// # Example
 ///
-/// Examples: user listings, analytics, dashboards, search
-///
-/// ## `.write()` - For Write Operations
-///
-/// Use for operations that:
-/// - Modify data (INSERT, UPDATE, DELETE)
-/// - Require transactions
-/// - Need locking reads (SELECT FOR UPDATE)
-/// - Require read-after-write consistency
-///
-/// Examples: creating records, updates, deletes, transactions
-///
-/// # Example Implementation
-///
-/// ```
+/// ```rust
 /// use sqlx::PgPool;
-/// use sqlx_pool_router::PoolProvider;
+/// use sqlx_pool_router::{PoolHandle, PoolProvider};
 ///
 /// #[derive(Clone)]
 /// struct MyPools {
@@ -180,12 +342,12 @@ use std::ops::Deref;
 /// }
 ///
 /// impl PoolProvider for MyPools {
-///     fn read(&self) -> &PgPool {
-///         self.replica.as_ref().unwrap_or(&self.primary)
+///     fn read(&self) -> PoolHandle {
+///         self.replica.as_ref().unwrap_or(&self.primary).clone().into()
 ///     }
 ///
-///     fn write(&self) -> &PgPool {
-///         &self.primary
+///     fn write(&self) -> PoolHandle {
+///         self.primary.clone().into()
 ///     }
 /// }
 /// ```
@@ -194,20 +356,28 @@ pub trait PoolProvider: Clone + Send + Sync + 'static {
     ///
     /// May return a read replica for load distribution, or fall back to
     /// the primary pool if no replica is configured.
-    fn read(&self) -> &PgPool;
+    fn read(&self) -> PoolHandle;
 
     /// Get a pool for write operations.
     ///
     /// Should always return the primary pool to ensure ACID guarantees
     /// and read-after-write consistency.
-    fn write(&self) -> &PgPool;
+    fn write(&self) -> PoolHandle;
 }
 
-/// Database pool abstraction supporting read replicas.
+/// The pools a [`DbPools`] is currently routing to.
+#[derive(Debug)]
+struct PoolSet {
+    primary: PgPool,
+    replica: Option<PgPool>,
+}
+
+/// Database pool abstraction supporting read replicas and runtime replacement.
 ///
-/// Wraps primary and optional replica pools, providing methods for
-/// explicit read/write routing while maintaining backwards compatibility
-/// through `Deref<Target = PgPool>`.
+/// Wraps primary and optional replica pools, providing explicit read/write
+/// routing. Cloning a `DbPools` is cheap and every clone shares the same
+/// underlying pool set: after [`replace`](Self::replace), all clones route to
+/// the new pools.
 ///
 /// # Examples
 ///
@@ -251,8 +421,7 @@ pub trait PoolProvider: Clone + Send + Sync + 'static {
 /// ```
 #[derive(Clone, Debug)]
 pub struct DbPools {
-    primary: PgPool,
-    replica: Option<PgPool>,
+    inner: Arc<ArcSwap<PoolSet>>,
 }
 
 impl DbPools {
@@ -274,10 +443,10 @@ impl DbPools {
     /// # }
     /// ```
     pub fn new(primary: PgPool) -> Self {
-        Self {
+        Self::from_set(PoolSet {
             primary,
             replica: None,
-        }
+        })
     }
 
     /// Create a new DbPools with primary and replica pools.
@@ -307,15 +476,56 @@ impl DbPools {
     /// # }
     /// ```
     pub fn with_replica(primary: PgPool, replica: PgPool) -> Self {
-        Self {
+        Self::from_set(PoolSet {
             primary,
             replica: Some(replica),
+        })
+    }
+
+    fn from_set(set: PoolSet) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(set)),
         }
+    }
+
+    /// Atomically replace the active pools.
+    ///
+    /// Returns the previous `(primary, replica)` so the caller can drain them
+    /// (typically `old.close().await` on a background task — `close()` shuts
+    /// idle connections immediately and checked-out ones as they are returned,
+    /// so in-flight work completes untouched).
+    ///
+    /// Every clone of this `DbPools` routes to the new pools from its next
+    /// `.read()` / `.write()` call. [`PoolHandle`]s obtained *before* the
+    /// swap keep pointing at the old pools.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use sqlx::postgres::PgPoolOptions;
+    /// use sqlx_pool_router::DbPools;
+    ///
+    /// # async fn example(pools: DbPools) -> Result<(), sqlx::Error> {
+    /// let resized = PgPoolOptions::new()
+    ///     .max_connections(8)
+    ///     .connect_lazy("postgresql://primary/db")?;
+    /// let (old_primary, old_replica) = pools.replace(resized, None);
+    /// tokio::spawn(async move {
+    ///     old_primary.close().await;
+    ///     if let Some(r) = old_replica { r.close().await; }
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn replace(&self, primary: PgPool, replica: Option<PgPool>) -> (PgPool, Option<PgPool>) {
+        let old = self.inner.swap(Arc::new(PoolSet { primary, replica }));
+        (old.primary.clone(), old.replica.clone())
     }
 
     /// Check if a replica pool is configured.
     ///
-    /// Returns `true` if a replica pool was provided via [`with_replica`](Self::with_replica).
+    /// Returns `true` if a replica pool was provided via [`with_replica`](Self::with_replica)
+    /// or the last [`replace`](Self::replace).
     ///
     /// # Example
     ///
@@ -331,7 +541,7 @@ impl DbPools {
     /// # }
     /// ```
     pub fn has_replica(&self) -> bool {
-        self.replica.is_some()
+        self.inner.load().replica.is_some()
     }
 
     /// Close all database connections.
@@ -352,32 +562,73 @@ impl DbPools {
     /// # }
     /// ```
     pub async fn close(&self) {
-        self.primary.close().await;
-        if let Some(replica) = &self.replica {
+        let set = self.inner.load_full();
+        set.primary.close().await;
+        if let Some(replica) = &set.replica {
             replica.close().await;
         }
     }
 }
 
 impl PoolProvider for DbPools {
-    fn read(&self) -> &PgPool {
-        self.replica.as_ref().unwrap_or(&self.primary)
+    fn read(&self) -> PoolHandle {
+        let set = self.inner.load();
+        PoolHandle(set.replica.as_ref().unwrap_or(&set.primary).clone())
     }
 
-    fn write(&self) -> &PgPool {
-        &self.primary
+    fn write(&self) -> PoolHandle {
+        PoolHandle(self.inner.load().primary.clone())
     }
 }
 
-/// Dereferences to the primary pool.
-///
-/// This allows natural usage like `&*pools` when you need a `&PgPool`.
-/// For explicit routing, use `.read()` or `.write()` methods.
-impl Deref for DbPools {
-    type Target = PgPool;
+/// `&DbPools` executes directly against the **primary** pool that is active
+/// at call time, so a long-lived component can hold a `DbPools` (instead of a
+/// pinned `PgPool`) and still write `query.execute(&self.pools)`. This is the
+/// replacement for the removed `Deref<Target = PgPool>`; it never routes to
+/// the replica — use `.read()` for that.
+impl<'p> Executor<'p> for &'_ DbPools {
+    type Database = Postgres;
 
-    fn deref(&self) -> &Self::Target {
-        &self.primary
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<Self::Database as Database>::QueryResult, <Self::Database as Database>::Row>,
+            SqlxError,
+        >,
+    >
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.write().fetch_many(query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, SqlxError>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.write().fetch_optional(query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<Self::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+        self.write().prepare_with(sql, parameters)
+    }
+
+    #[doc(hidden)]
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
+        self.write().describe(sql)
     }
 }
 
@@ -408,12 +659,141 @@ impl Deref for DbPools {
 /// # }
 /// ```
 impl PoolProvider for PgPool {
-    fn read(&self) -> &PgPool {
-        self
+    fn read(&self) -> PoolHandle {
+        PoolHandle(self.clone())
     }
 
-    fn write(&self) -> &PgPool {
-        self
+    fn write(&self) -> PoolHandle {
+        PoolHandle(self.clone())
+    }
+}
+
+/// Object-safe view of a [`PoolProvider`], for storing a provider without
+/// naming its concrete type.
+///
+/// Implemented for every `PoolProvider`; you normally use it through
+/// [`DynPools`] rather than directly.
+pub trait PoolSource: Send + Sync + 'static {
+    /// See [`PoolProvider::read`].
+    fn read_pool(&self) -> PoolHandle;
+    /// See [`PoolProvider::write`].
+    fn write_pool(&self) -> PoolHandle;
+}
+
+impl<P: PoolProvider> PoolSource for P {
+    fn read_pool(&self) -> PoolHandle {
+        self.read()
+    }
+
+    fn write_pool(&self) -> PoolHandle {
+        self.write()
+    }
+}
+
+/// A type-erased, cheaply clonable [`PoolProvider`].
+///
+/// Long-lived components (middleware state, background tasks, caches) should
+/// hold one of these instead of a pinned `PgPool`: every `.read()` /
+/// `.write()` goes back to the underlying provider, so a runtime pool swap
+/// ([`DbPools::replace`]) reaches them without a restart, and generic code
+/// (`AppState<P: PoolProvider>`) can hand out a `DynPools` without making the
+/// holder generic too.
+///
+/// # Example
+///
+/// ```rust
+/// use sqlx_pool_router::{DynPools, PoolProvider};
+///
+/// struct Cache {
+///     pools: DynPools,
+/// }
+///
+/// impl Cache {
+///     fn new(pools: impl PoolProvider) -> Self {
+///         Self { pools: DynPools::new(pools) }
+///     }
+///
+///     async fn lookup(&self) -> Result<i64, sqlx::Error> {
+///         sqlx::query_scalar("SELECT 1").fetch_one(self.pools.read()).await
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct DynPools(Arc<dyn PoolSource>);
+
+impl DynPools {
+    /// Erase `provider`'s type. Wrapping a `DynPools` returns it unchanged
+    /// (no double indirection).
+    pub fn new<P: PoolProvider>(provider: P) -> Self {
+        let any: &dyn std::any::Any = &provider;
+        if let Some(existing) = any.downcast_ref::<DynPools>() {
+            return existing.clone();
+        }
+        Self(Arc::new(provider))
+    }
+}
+
+impl fmt::Debug for DynPools {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DynPools")
+    }
+}
+
+impl PoolProvider for DynPools {
+    fn read(&self) -> PoolHandle {
+        self.0.read_pool()
+    }
+
+    fn write(&self) -> PoolHandle {
+        self.0.write_pool()
+    }
+}
+
+/// `&DynPools` executes against the **primary** pool active at call time,
+/// mirroring `&DbPools`.
+impl<'p> Executor<'p> for &'_ DynPools {
+    type Database = Postgres;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<<Self::Database as Database>::QueryResult, <Self::Database as Database>::Row>,
+            SqlxError,
+        >,
+    >
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.write().fetch_many(query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<Self::Database as Database>::Row>, SqlxError>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.write().fetch_optional(query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<Self::Database as Database>::TypeInfo],
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+        self.write().prepare_with(sql, parameters)
+    }
+
+    #[doc(hidden)]
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
+        self.write().describe(sql)
     }
 }
 
@@ -559,12 +939,12 @@ impl TestDbPools {
 }
 
 impl PoolProvider for TestDbPools {
-    fn read(&self) -> &PgPool {
-        &self.replica
+    fn read(&self) -> PoolHandle {
+        PoolHandle(self.replica.clone())
     }
 
-    fn write(&self) -> &PgPool {
-        &self.primary
+    fn write(&self) -> PoolHandle {
+        PoolHandle(self.primary.clone())
     }
 }
 
@@ -641,6 +1021,12 @@ mod tests {
         format!("postgres://postgres:password@localhost:5432/{}", database)
     }
 
+    /// Identity of the pool behind a handle: two handles point at the same
+    /// pool iff they share the same `Arc<PgConnectOptions>` allocation.
+    fn same_pool(a: &PgPool, b: &PgPool) -> bool {
+        Arc::ptr_eq(&a.connect_options(), &b.connect_options())
+    }
+
     #[sqlx::test]
     async fn test_dbpools_without_replica(pool: PgPool) {
         let db_pools = DbPools::new(pool.clone());
@@ -661,9 +1047,10 @@ mod tests {
             .unwrap();
         assert_eq!(write_result.0, 2);
 
-        // Deref should also work
+        // A handle derefs to PgPool, so `&*handle` is a `&PgPool`
+        let handle = db_pools.write();
         let deref_result: (i32,) = sqlx::query_as("SELECT 3")
-            .fetch_one(&*db_pools)
+            .fetch_one(&*handle)
             .await
             .unwrap();
         assert_eq!(deref_result.0, 3);
@@ -706,21 +1093,104 @@ mod tests {
             "write() should route to primary"
         );
 
-        // Deref should return primary
-        let deref_marker: (String,) = sqlx::query_as("SELECT name FROM db_marker")
-            .fetch_one(&*db_pools)
-            .await
-            .unwrap();
-        assert_eq!(
-            deref_marker.0, primary_name,
-            "deref should route to primary"
-        );
-
         // Cleanup
         primary_pool.close().await;
         replica_pool.close().await;
         drop_test_db(&admin_pool, &primary_name).await;
         drop_test_db(&admin_pool, &replica_name).await;
+    }
+
+    #[sqlx::test]
+    async fn replace_swaps_pools_for_existing_clones(pool: PgPool) {
+        let pool_a = pool;
+        let pool_b = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool_a.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let pools = DbPools::new(pool_a.clone());
+        // Simulates a daemon that captured the provider at boot.
+        let held_clone = pools.clone();
+        // A handle taken BEFORE the swap keeps pointing at the old pool.
+        let pre_swap_handle = held_clone.write();
+
+        let (old_primary, old_replica) = pools.replace(pool_b.clone(), None);
+
+        assert!(same_pool(&old_primary, &pool_a), "old primary handed back");
+        assert!(old_replica.is_none());
+        assert!(same_pool(&held_clone.write(), &pool_b), "clone routes to new pool");
+        assert!(same_pool(&held_clone.read(), &pool_b), "no replica: read follows primary");
+        assert!(same_pool(&pre_swap_handle, &pool_a), "pre-swap handle pinned to old pool");
+        assert!(!pools.has_replica());
+
+        // The new pool is usable through every clone, by handle or directly.
+        let via_clone: (i32,) = sqlx::query_as("SELECT 4")
+            .fetch_one(held_clone.write())
+            .await
+            .unwrap();
+        assert_eq!(via_clone.0, 4);
+        let direct: (i32,) = sqlx::query_as("SELECT 44")
+            .fetch_one(&held_clone)
+            .await
+            .unwrap();
+        assert_eq!(direct.0, 44);
+
+        // Draining the old pool does not affect the new one.
+        old_primary.close().await;
+        let still_ok: (i32,) = sqlx::query_as("SELECT 5")
+            .fetch_one(pools.read())
+            .await
+            .unwrap();
+        assert_eq!(still_ok.0, 5);
+    }
+
+    #[sqlx::test]
+    async fn replace_can_add_and_drop_replica(pool: PgPool) {
+        let make = || async {
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(pool.connect_options().as_ref().clone())
+                .await
+                .unwrap()
+        };
+        let pools = DbPools::new(pool.clone());
+        assert!(!pools.has_replica());
+
+        let replica = make().await;
+        pools.replace(pool.clone(), Some(replica.clone()));
+        assert!(pools.has_replica());
+        assert!(same_pool(&pools.read(), &replica), "read routes to new replica");
+
+        let (_, dropped) = pools.replace(pool.clone(), None);
+        assert!(same_pool(dropped.as_ref().unwrap(), &replica));
+        assert!(!pools.has_replica());
+    }
+
+    #[sqlx::test]
+    async fn dyn_pools_follow_the_underlying_provider(pool: PgPool) {
+        let pool_b = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let pools = DbPools::new(pool.clone());
+        let erased = DynPools::new(pools.clone());
+        assert!(same_pool(&erased.write(), &pool));
+
+        pools.replace(pool_b.clone(), None);
+        assert!(same_pool(&erased.write(), &pool_b), "erased view sees the swap");
+        assert!(same_pool(&erased.read(), &pool_b));
+
+        let via_ref: (i32,) = sqlx::query_as("SELECT 6").fetch_one(&erased).await.unwrap();
+        assert_eq!(via_ref.0, 6);
+
+        // Re-wrapping does not add indirection.
+        let rewrapped = DynPools::new(erased.clone());
+        assert!(Arc::ptr_eq(&rewrapped.0, &erased.0));
+
+        // A bare PgPool can be erased too (test harnesses).
+        let from_pg = DynPools::new(pool.clone());
+        assert!(same_pool(&from_pg.read(), &pool));
     }
 
     #[sqlx::test]
@@ -733,8 +1203,9 @@ mod tests {
 
     #[sqlx::test]
     async fn test_pgpool_implements_pool_provider(pool: PgPool) {
-        // PgPool should implement PoolProvider
-        assert_eq!(pool.read() as *const _, pool.write() as *const _);
+        // PgPool should implement PoolProvider, routing both ways to itself
+        assert!(same_pool(&pool.read(), &pool));
+        assert!(same_pool(&pool.write(), &pool));
 
         // Should be able to use it the same way
         let result: (i32,) = sqlx::query_as("SELECT 1")
@@ -742,6 +1213,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.0, 1);
+    }
+
+    #[sqlx::test]
+    async fn pool_handle_executes_every_executor_path(pool: PgPool) {
+        let handle = pool.write();
+
+        // fetch_optional / fetch_one path
+        let one: (i32,) = sqlx::query_as("SELECT 7")
+            .fetch_one(handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(one.0, 7);
+
+        // fetch_many path (fetch_all streams)
+        let many: Vec<(i32,)> = sqlx::query_as("SELECT * FROM generate_series(1, 3)")
+            .fetch_all(handle.clone())
+            .await
+            .unwrap();
+        assert_eq!(many.len(), 3);
+
+        // execute path, by value and by reference
+        let done = sqlx::query("SELECT 1").execute(handle.clone()).await.unwrap();
+        assert_eq!(done.rows_affected(), 1);
+        let done = sqlx::query("SELECT 1").execute(&handle).await.unwrap();
+        assert_eq!(done.rows_affected(), 1);
+
+        // prepare path
+        use sqlx::Statement as _;
+        let stmt = sqlx::Executor::prepare(handle.clone(), "SELECT $1::int")
+            .await
+            .unwrap();
+        let prepared: (i32,) = stmt.query_as().bind(9).fetch_one(handle).await.unwrap();
+        assert_eq!(prepared.0, 9);
     }
 
     #[sqlx::test]
@@ -779,17 +1283,5 @@ mod tests {
             .expect("Read pool should allow SELECT");
 
         assert_eq!(result.0, 2, "Should compute 1 + 1 = 2");
-    }
-
-    #[sqlx::test]
-    async fn test_testdbpools_write_pool_allows_writes(_pool: PgPool) {
-        // Note: This test is removed because sqlx::test doesn't easily support
-        // testing TEMP tables (which are per-connection) with TestDbPools
-        // (which creates separate connection pools).
-        //
-        // The functionality is still well-tested by:
-        // - test_testdbpools_read_pool_rejects_writes (proves read pool rejects writes)
-        // - test_testdbpools_read_pool_allows_selects (proves read pool allows reads)
-        // - Integration tests in examples/testing.rs
     }
 }

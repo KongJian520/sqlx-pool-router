@@ -82,6 +82,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Replacing pools at runtime
+
+sqlx pools are fixed-size once built. When the right size changes while the
+process is running — e.g. a per-role connection budget re-divided across a
+changing number of replicas — build a new pool and swap it in:
+
+```rust
+let (old_primary, old_replica) = pools.replace(new_primary, None);
+tokio::spawn(async move {
+    old_primary.close().await; // idle now, checked-out as they return
+    if let Some(r) = old_replica { r.close().await; }
+});
+```
+
+Every clone of the `DbPools` routes to the new pool from its next `.read()` /
+`.write()`. `.read()`/`.write()` return an owned `PoolHandle` (one `Arc` clone
+of the pool active at that moment) that derefs to `PgPool` and executes like
+`&PgPool`; don't cache it. Long-lived components that can't name the provider
+type (middleware state, caches, background tasks) can hold a type-erased
+`DynPools` instead of a pinned `PgPool`.
+
 ## Testing with `TestDbPools`
 
 The crate includes a `TestDbPools` helper for use with `#[sqlx::test]` that enforces read/write separation in your tests:

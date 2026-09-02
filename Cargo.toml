@@ -1,6 +1,6 @@
 [package]
 name = "sqlx-pool-router"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["fergus.finn@doubleword.ai"]
 description = "Lightweight SQLx PostgreSQL connection pool routing for primary/replica separation"
@@ -11,6 +11,10 @@ categories = ["database", "asynchronous"]
 readme = "README.md"
 
 [dependencies]
+arc-swap = "1"
+async-stream = "0.3"
+either = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await-macro"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
 
 [dev-dependencies]
