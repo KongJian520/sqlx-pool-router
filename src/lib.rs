@@ -568,6 +568,16 @@ impl DbPools {
             replica.close().await;
         }
     }
+
+    /// Inherent alias of [`PoolProvider::read`], usable without importing the trait.
+    pub fn read(&self) -> PoolHandle {
+        PoolProvider::read(self)
+    }
+
+    /// Inherent alias of [`PoolProvider::write`], usable without importing the trait.
+    pub fn write(&self) -> PoolHandle {
+        PoolProvider::write(self)
+    }
 }
 
 impl PoolProvider for DbPools {
@@ -730,6 +740,16 @@ impl DynPools {
             return existing.clone();
         }
         Self(Arc::new(provider))
+    }
+
+    /// Inherent alias of [`PoolProvider::read`], usable without importing the trait.
+    pub fn read(&self) -> PoolHandle {
+        self.0.read_pool()
+    }
+
+    /// Inherent alias of [`PoolProvider::write`], usable without importing the trait.
+    pub fn write(&self) -> PoolHandle {
+        self.0.write_pool()
     }
 }
 
