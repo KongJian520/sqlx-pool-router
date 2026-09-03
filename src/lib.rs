@@ -122,6 +122,14 @@
 //! async fn test_read_write_routing(pool: PgPool) {
 //!     let pools = TestDbPools::new(pool).await.unwrap();
 //!
+//!     // A fresh #[sqlx::test] database is empty: create a regular table first
+//!     // (through the write pool — TEMP tables are per-connection, so a pooled
+//!     // insert could land on a connection that cannot see one).
+//!     sqlx::query("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
+//!         .execute(pools.write())
+//!         .await
+//!         .unwrap();
+
 //!     // This works - writes go to write pool
 //!     sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
 //!         .execute(pools.write())
@@ -838,7 +846,7 @@ impl<'p> Executor<'p> for &'_ DynPools {
 ///     let pools = TestDbPools::new(pool).await.unwrap();
 ///
 ///     // Write operations work on .write()
-///     sqlx::query("CREATE TEMP TABLE users (id INT)")
+///     sqlx::query("CREATE TABLE users (id INT)")
 ///         .execute(pools.write())
 ///         .await
 ///         .expect("Write pool should allow writes");
