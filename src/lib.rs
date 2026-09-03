@@ -903,7 +903,7 @@ impl<'p> Executor<'p> for &'_ DynPools {
 ///     let repo = Repository { pools };
 ///
 ///     // Test will fail if create_user incorrectly uses .read()
-///     sqlx::query("CREATE TEMP TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
+///     sqlx::query("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
 ///         .execute(repo.pools.write())
 ///         .await
 ///         .unwrap();

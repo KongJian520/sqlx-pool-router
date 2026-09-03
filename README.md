@@ -116,17 +116,25 @@ async fn test_repository(pool: PgPool) {
     // TestDbPools creates a read-only replica from the same database
     let pools = TestDbPools::new(pool).await.unwrap();
 
-    // Writes through .read() will FAIL - catches bugs immediately!
-    let result = sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
-        .execute(pools.read())
-        .await;
-    assert!(result.is_err());
-
-    // Writes through .write() work fine
-    sqlx::query("CREATE TEMP TABLE users (id INT, name TEXT)")
+    // A fresh #[sqlx::test] database is empty: create the table through the
+    // write pool first (a regular table, not TEMP — TEMP tables are
+    // per-connection and a pooled query may not see one).
+    sqlx::query("CREATE TABLE users (id INT, name TEXT)")
         .execute(pools.write())
         .await
         .unwrap();
+
+    // Writes through .write() work fine
+    sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
+        .execute(pools.write())
+        .await
+        .unwrap();
+
+    // Writes through .read() FAIL with a read-only error - catches bugs immediately!
+    let result = sqlx::query("INSERT INTO users (name) VALUES ('Bob')")
+        .execute(pools.read())
+        .await;
+    assert!(result.is_err());
 }
 ```
 
