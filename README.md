@@ -82,6 +82,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Replacing pools at runtime
+
+sqlx pools are fixed-size once built. When the right size changes while the
+process is running — e.g. a per-role connection budget re-divided across a
+changing number of replicas — build a new pool and swap it in:
+
+```rust
+let (old_primary, old_replica) = pools.replace(new_primary, None);
+tokio::spawn(async move {
+    old_primary.close().await; // idle now, checked-out as they return
+    if let Some(r) = old_replica { r.close().await; }
+});
+```
+
+Every clone of the `DbPools` routes to the new pool from its next `.read()` /
+`.write()`. `.read()`/`.write()` return an owned `PoolHandle` (one `Arc` clone
+of the pool active at that moment) that derefs to `PgPool` and executes like
+`&PgPool`; don't cache it. Long-lived components that can't name the provider
+type (middleware state, caches, background tasks) can hold a type-erased
+`DynPools` instead of a pinned `PgPool`.
+
 ## Testing with `TestDbPools`
 
 The crate includes a `TestDbPools` helper for use with `#[sqlx::test]` that enforces read/write separation in your tests:
@@ -95,17 +116,25 @@ async fn test_repository(pool: PgPool) {
     // TestDbPools creates a read-only replica from the same database
     let pools = TestDbPools::new(pool).await.unwrap();
 
-    // Writes through .read() will FAIL - catches bugs immediately!
-    let result = sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
-        .execute(pools.read())
-        .await;
-    assert!(result.is_err());
-
-    // Writes through .write() work fine
-    sqlx::query("CREATE TEMP TABLE users (id INT, name TEXT)")
+    // A fresh #[sqlx::test] database is empty: create the table through the
+    // write pool first (a regular table, not TEMP — TEMP tables are
+    // per-connection and a pooled query may not see one).
+    sqlx::query("CREATE TABLE users (id INT, name TEXT)")
         .execute(pools.write())
         .await
         .unwrap();
+
+    // Writes through .write() work fine
+    sqlx::query("INSERT INTO users (name) VALUES ('Alice')")
+        .execute(pools.write())
+        .await
+        .unwrap();
+
+    // Writes through .read() FAIL with a read-only error - catches bugs immediately!
+    let result = sqlx::query("INSERT INTO users (name) VALUES ('Bob')")
+        .execute(pools.read())
+        .await;
+    assert!(result.is_err());
 }
 ```
 
