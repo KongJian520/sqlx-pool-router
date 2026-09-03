@@ -142,9 +142,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use either::Either;
-use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
+use futures_util::TryStreamExt;
 use sqlx::postgres::PgPool;
 use sqlx::{Database, Describe, Error as SqlxError, Execute, Executor, Postgres};
 
@@ -1138,9 +1138,18 @@ mod tests {
 
         assert!(same_pool(&old_primary, &pool_a), "old primary handed back");
         assert!(old_replica.is_none());
-        assert!(same_pool(&held_clone.write(), &pool_b), "clone routes to new pool");
-        assert!(same_pool(&held_clone.read(), &pool_b), "no replica: read follows primary");
-        assert!(same_pool(&pre_swap_handle, &pool_a), "pre-swap handle pinned to old pool");
+        assert!(
+            same_pool(&held_clone.write(), &pool_b),
+            "clone routes to new pool"
+        );
+        assert!(
+            same_pool(&held_clone.read(), &pool_b),
+            "no replica: read follows primary"
+        );
+        assert!(
+            same_pool(&pre_swap_handle, &pool_a),
+            "pre-swap handle pinned to old pool"
+        );
         assert!(!pools.has_replica());
 
         // The new pool is usable through every clone, by handle or directly.
@@ -1179,7 +1188,10 @@ mod tests {
         let replica = make().await;
         pools.replace(pool.clone(), Some(replica.clone()));
         assert!(pools.has_replica());
-        assert!(same_pool(&pools.read(), &replica), "read routes to new replica");
+        assert!(
+            same_pool(&pools.read(), &replica),
+            "read routes to new replica"
+        );
 
         let (_, dropped) = pools.replace(pool.clone(), None);
         assert!(same_pool(dropped.as_ref().unwrap(), &replica));
@@ -1198,7 +1210,10 @@ mod tests {
         assert!(same_pool(&erased.write(), &pool));
 
         pools.replace(pool_b.clone(), None);
-        assert!(same_pool(&erased.write(), &pool_b), "erased view sees the swap");
+        assert!(
+            same_pool(&erased.write(), &pool_b),
+            "erased view sees the swap"
+        );
         assert!(same_pool(&erased.read(), &pool_b));
 
         let via_ref: (i32,) = sqlx::query_as("SELECT 6").fetch_one(&erased).await.unwrap();
@@ -1254,7 +1269,10 @@ mod tests {
         assert_eq!(many.len(), 3);
 
         // execute path, by value and by reference
-        let done = sqlx::query("SELECT 1").execute(handle.clone()).await.unwrap();
+        let done = sqlx::query("SELECT 1")
+            .execute(handle.clone())
+            .await
+            .unwrap();
         assert_eq!(done.rows_affected(), 1);
         let done = sqlx::query("SELECT 1").execute(&handle).await.unwrap();
         assert_eq!(done.rows_affected(), 1);
