@@ -23,6 +23,12 @@ tokio = { version = "1.0", features = ["full"] }
 url = "2.5"
 sqlx = { version = "0.9", features = ["postgres", "macros", "runtime-tokio"] }
 
+[features]
+default = []
+# sqlx 0.9 的 Executor::describe 是 sqlx-core/offline 条件方法；offline 经 sqlx/macros 间接启用。
+# 测试（#[sqlx::test] 需 macros）时启用本 feature 以同步实现 describe。
+offline = ["sqlx/macros"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

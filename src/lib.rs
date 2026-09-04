@@ -154,7 +154,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::TryStreamExt;
 use sqlx::postgres::PgPool;
-use sqlx::{Database, Error as SqlxError, Execute, Executor, Postgres, SqlStr};
+use sqlx::{AssertSqlSafe, Database, Describe, Error as SqlxError, Execute, Executor, Postgres, SqlStr};
 
 /// A cheap, owned handle to a `PgPool`.
 ///
@@ -269,6 +269,18 @@ impl<'p> Executor<'p> for PoolHandle {
         })
     }
 
+    #[cfg(feature = "offline")]
+    fn describe<'e>(
+        self,
+        _sql: SqlStr,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>>
+    where
+        'p: 'e,
+    {
+        Box::pin(async move { Err(SqlxError::Protocol("describe not supported in offline mode".into())) })
+    }
+
+
 }
 
 /// `&PoolHandle` executes too, so `.execute(&handle)` works wherever code
@@ -312,6 +324,18 @@ impl<'p> Executor<'p> for &'_ PoolHandle {
     {
         self.clone().prepare_with(sql, parameters)
     }
+
+    #[cfg(feature = "offline")]
+    fn describe<'e>(
+        self,
+        _sql: SqlStr,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>>
+    where
+        'p: 'e,
+    {
+        Box::pin(async move { Err(SqlxError::Protocol("describe not supported in offline mode".into())) })
+    }
+
 
 }
 
@@ -632,6 +656,18 @@ impl<'p> Executor<'p> for &'_ DbPools {
         self.write().prepare_with(sql, parameters)
     }
 
+    #[cfg(feature = "offline")]
+    fn describe<'e>(
+        self,
+        _sql: SqlStr,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>>
+    where
+        'p: 'e,
+    {
+        Box::pin(async move { Err(SqlxError::Protocol("describe not supported in offline mode".into())) })
+    }
+
+
 }
 
 /// Implement PoolProvider for PgPool for backward compatibility.
@@ -803,6 +839,18 @@ impl<'p> Executor<'p> for &'_ DynPools {
         self.write().prepare_with(sql, parameters)
     }
 
+    #[cfg(feature = "offline")]
+    fn describe<'e>(
+        self,
+        _sql: SqlStr,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>>
+    where
+        'p: 'e,
+    {
+        Box::pin(async move { Err(SqlxError::Protocol("describe not supported in offline mode".into())) })
+    }
+
+
 }
 
 /// Test pool provider with read-only replica enforcement.
@@ -966,20 +1014,20 @@ mod tests {
         let db_name = format!("test_dbpools_{}", suffix);
 
         // Clean up if exists
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
             db_name
-        ))
+        )))
         .execute(admin_pool)
         .await
         .ok();
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {}", db_name))
+        sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {}", db_name)))
             .execute(admin_pool)
             .await
             .unwrap();
 
         // Create fresh database
-        sqlx::query(&format!("CREATE DATABASE {}", db_name))
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {}", db_name)))
             .execute(admin_pool)
             .await
             .unwrap();
@@ -997,7 +1045,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query(&format!("INSERT INTO db_marker VALUES ('{}')", db_name))
+        sqlx::query(AssertSqlSafe(format!("INSERT INTO db_marker VALUES ('{}')", db_name)))
             .execute(&pool)
             .await
             .unwrap();
@@ -1006,14 +1054,14 @@ mod tests {
     }
 
     async fn drop_test_db(admin_pool: &PgPool, db_name: &str) {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
             db_name
-        ))
+        )))
         .execute(admin_pool)
         .await
         .ok();
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {}", db_name))
+        sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {}", db_name)))
             .execute(admin_pool)
             .await
             .ok();
@@ -1267,7 +1315,7 @@ mod tests {
 
         // prepare path
         use sqlx::Statement as _;
-        let stmt = sqlx::Executor::prepare(handle.clone(), "SELECT $1::int")
+        let stmt = sqlx::Executor::prepare(handle.clone(), SqlStr::from_static("SELECT $1::int"))
             .await
             .unwrap();
         let prepared: (i32,) = stmt.query_as().bind(9).fetch_one(handle).await.unwrap();
