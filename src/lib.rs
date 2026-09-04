@@ -269,7 +269,6 @@ impl<'p> Executor<'p> for PoolHandle {
         })
     }
 
-    #[cfg(feature = "offline")]
     fn describe<'e>(
         self,
         _sql: SqlStr,
@@ -325,7 +324,6 @@ impl<'p> Executor<'p> for &'_ PoolHandle {
         self.clone().prepare_with(sql, parameters)
     }
 
-    #[cfg(feature = "offline")]
     fn describe<'e>(
         self,
         _sql: SqlStr,
@@ -656,7 +654,6 @@ impl<'p> Executor<'p> for &'_ DbPools {
         self.write().prepare_with(sql, parameters)
     }
 
-    #[cfg(feature = "offline")]
     fn describe<'e>(
         self,
         _sql: SqlStr,
@@ -839,7 +836,6 @@ impl<'p> Executor<'p> for &'_ DynPools {
         self.write().prepare_with(sql, parameters)
     }
 
-    #[cfg(feature = "offline")]
     fn describe<'e>(
         self,
         _sql: SqlStr,

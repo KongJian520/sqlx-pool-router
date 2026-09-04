@@ -15,7 +15,7 @@ arc-swap = "1"
 async-stream = "0.3"
 either = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await-macro"] }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
 tinyvec = "=1.12.0" # 锁定：1.13.0 在 nightly 下 vec! 宏导入失败
 
 [dev-dependencies]
