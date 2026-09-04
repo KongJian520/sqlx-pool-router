@@ -154,7 +154,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::TryStreamExt;
 use sqlx::postgres::PgPool;
-use sqlx::{Database, Describe, Error as SqlxError, Execute, Executor, Postgres};
+use sqlx::{Database, Error as SqlxError, Execute, Executor, Postgres, SqlStr};
 
 /// A cheap, owned handle to a `PgPool`.
 ///
@@ -254,11 +254,14 @@ impl<'p> Executor<'p> for PoolHandle {
         })
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: SqlStr,
         parameters: &'e [<Self::Database as Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, SqlxError>>
+    where
+        'p: 'e,
+    {
         let pool = self.0;
         Box::pin(async move {
             let mut connection = pool.acquire().await?;
@@ -266,17 +269,6 @@ impl<'p> Executor<'p> for PoolHandle {
         })
     }
 
-    #[doc(hidden)]
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
-        let pool = self.0;
-        Box::pin(async move {
-            let mut connection = pool.acquire().await?;
-            connection.describe(sql).await
-        })
-    }
 }
 
 /// `&PoolHandle` executes too, so `.execute(&handle)` works wherever code
@@ -310,21 +302,17 @@ impl<'p> Executor<'p> for &'_ PoolHandle {
         self.clone().fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: SqlStr,
         parameters: &'e [<Self::Database as Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, SqlxError>>
+    where
+        'p: 'e,
+    {
         self.clone().prepare_with(sql, parameters)
     }
 
-    #[doc(hidden)]
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
-        self.clone().describe(sql)
-    }
 }
 
 /// Trait for providing database connection pools with read/write routing.
@@ -633,21 +621,17 @@ impl<'p> Executor<'p> for &'_ DbPools {
         self.write().fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: SqlStr,
         parameters: &'e [<Self::Database as Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, SqlxError>>
+    where
+        'p: 'e,
+    {
         self.write().prepare_with(sql, parameters)
     }
 
-    #[doc(hidden)]
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
-        self.write().describe(sql)
-    }
 }
 
 /// Implement PoolProvider for PgPool for backward compatibility.
@@ -808,21 +792,17 @@ impl<'p> Executor<'p> for &'_ DynPools {
         self.write().fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: SqlStr,
         parameters: &'e [<Self::Database as Database>::TypeInfo],
-    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
+    ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement, SqlxError>>
+    where
+        'p: 'e,
+    {
         self.write().prepare_with(sql, parameters)
     }
 
-    #[doc(hidden)]
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
-        self.write().describe(sql)
-    }
 }
 
 /// Test pool provider with read-only replica enforcement.

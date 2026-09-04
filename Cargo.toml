@@ -15,12 +15,13 @@ arc-swap = "1"
 async-stream = "0.3"
 either = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await-macro"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
+tinyvec = "=1.12.0" # 锁定：1.13.0 在 nightly 下 vec! 宏导入失败
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full"] }
 url = "2.5"
-sqlx = { version = "0.8", features = ["postgres", "macros", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["postgres", "macros", "runtime-tokio"] }
 
 [package.metadata.docs.rs]
 all-features = true
